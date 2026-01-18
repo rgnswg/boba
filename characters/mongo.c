@@ -9,23 +9,27 @@ void Mongo_Q(Entity* self, Vector3 targetPos) {
     // Disparar proyectil hacia targetPos
     ProjectileManager* pm = (ProjectileManager*)self->context;
     
+    // Dirección puramente horizontal
     Vector3 dir = Vector3Subtract(targetPos, self->position);
-    dir.y = 0; // Mantener plano horizontal
+    dir.y = 0; // Forzar plano horizontal
+    dir = Vector3Normalize(dir);
 
-    // Spawnear proyectil: Pos, Dir, Speed=15, Vida=1.0s (aprox 15m), Radio=0.3, Color=Orange
-    // Vida = Distancia / Velocidad. Queremos 5 cubos (metros) de distancia?
-    // 5 metros / 15 m/s = 0.33 segundos. 
-    // Vamos a ponerle 1.0s para que viaje un poco más lejos visualmente.
-    
+    // Salir desde el centro del personaje (Y=1.0 si position.y=0, pero position ya es el centro?)
+    // Asumimos self->position es la base (Y=1.0 según main.c playerPos).
+    // Espera, en main.c playerPos es {0, 1, 0}. Si el cilindro mide 2.0 de alto, el centro geométrico es Y=1.0?
+    // Raylib DrawCylinder dibuja desde la posición base o centro? 
+    // DrawCylinder: "Draw a cylinder/cone... position is the center of the base" NO.
+    // Revisando Raylib cheatsheet: "position is center". 
+    // Entonces si playerPos es (0,1,0), el centro es (0,1,0). Perfecto.
+
     Proj_Spawn(pm, 
-               Vector3Add(self->position, (Vector3){0, 1.0f, 0}), // Salir un poco arriba
+               self->position, // Salir desde el centro mismo del jugador
                dir, 
                20.0f, 
-               0.5f, // 0.5s * 20m/s = 10 metros de rango
-               0.3f, 
+               0.5f, 
+               0.5f, // Radio mas grande (0.5f) para facilitar colision
+               50.0f, 
                ORANGE);
-    
-    // printf("Mongo lanza Q!\n");
 }
 
 void Mongo_Draw(Entity* self) {

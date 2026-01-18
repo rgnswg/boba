@@ -2,14 +2,16 @@
 #define PROJECTILE_H
 
 #include "raylib.h"
+#include "entity.h" // Necesitamos conocer a las entidades para golpearlas
 #include <stdbool.h>
 
 typedef struct {
     Vector3 position;
     Vector3 direction;
     float speed;
-    float lifeTime;     // Cuanto tiempo vive antes de desaparecer
+    float lifeTime;    
     float radius;
+    float damage;       // Daño que hace al impactar
     bool active;
     Color color;
 } Projectile;
@@ -22,8 +24,9 @@ typedef struct {
 } ProjectileManager;
 
 void Proj_Init(ProjectileManager* pm);
-void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, Color color);
-void Proj_Update(ProjectileManager* pm, float dt);
+void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, float damage, Color color);
+// Ahora Update recibe la lista de posibles víctimas
+void Proj_Update(ProjectileManager* pm, float dt, Entity* targets[], int targetCount);
 void Proj_Draw(ProjectileManager* pm);
 
 #endif

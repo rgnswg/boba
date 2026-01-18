@@ -7,7 +7,7 @@ void Proj_Init(ProjectileManager* pm) {
     }
 }
 
-void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, Color color) {
+void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, float damage, Color color) {
     for (int i = 0; i < MAX_PROJECTILES; i++) {
         if (!pm->pool[i].active) {
             pm->pool[i].active = true;
@@ -16,24 +16,49 @@ void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, fl
             pm->pool[i].speed = speed;
             pm->pool[i].lifeTime = life;
             pm->pool[i].radius = radius;
+            pm->pool[i].damage = damage;
             pm->pool[i].color = color;
             return;
         }
     }
 }
 
-void Proj_Update(ProjectileManager* pm, float dt) {
+void Proj_Update(ProjectileManager* pm, float dt, Entity* targets[], int targetCount) {
     for (int i = 0; i < MAX_PROJECTILES; i++) {
-        if (pm->pool[i].active) {
-            pm->pool[i].lifeTime -= dt;
-            if (pm->pool[i].lifeTime <= 0) {
-                pm->pool[i].active = false;
-                continue;
+        if (!pm->pool[i].active) continue;
+
+        Projectile* p = &pm->pool[i];
+
+        // 1. Ciclo de Vida
+        p->lifeTime -= dt;
+        if (p->lifeTime <= 0) {
+            p->active = false;
+            continue;
+        }
+        
+        // 2. Movimiento
+        Vector3 velocity = Vector3Scale(p->direction, p->speed * dt);
+        Vector3 nextPos = Vector3Add(p->position, velocity);
+        
+        // 3. Colisión con Entidades (Hit Detection simple)
+        bool hit = false;
+        for (int t = 0; t < targetCount; t++) {
+            Entity* ent = targets[t];
+            if (!ent->active) continue;
+
+            // Chequeo Esfera-Esfera (Radio Proyectil + Radio Entidad)
+            if (CheckCollisionSpheres(nextPos, p->radius, ent->position, ent->radius)) {
+                // IMPACTO!
+                Entity_TakeDamage(ent, p->damage);
+                hit = true;
+                break; // Un proyectil golpea a uno solo y desaparece (por ahora)
             }
-            
-            // Movimiento
-            Vector3 velocity = Vector3Scale(pm->pool[i].direction, pm->pool[i].speed * dt);
-            pm->pool[i].position = Vector3Add(pm->pool[i].position, velocity);
+        }
+
+        if (hit) {
+            p->active = false; // Destruir proyectil
+        } else {
+            p->position = nextPos;
         }
     }
 }

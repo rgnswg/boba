@@ -30,15 +30,16 @@ struct Entity {
     AbilityFunc onR;
     
     // Callbacks genéricos
-    UpdateFunc onUpdate; // Para lógica interna (ej: regenerar vida)
-    DrawFunc onDraw;     // Para dibujarse a sí mismo (Mongo es rojo, Paco azul)
+    UpdateFunc onUpdate; 
+    DrawFunc onDraw;
+    void (*onDeath)(Entity* self); // Nuevo: Callback cuando la vida llega a 0
 
     // Datos internos (Cooldowns, etc)
     float cdQ, cdW, cdE, cdR;
     float maxCdQ, maxCdW, maxCdE, maxCdR;
 
     // Referencias a sistemas externos
-    void* context; // Puntero genérico (ej: ProjectileManager*)
+    void* context; 
 };
 
 // Inicializa una entidad vacía por defecto
@@ -46,5 +47,8 @@ void Entity_Init(Entity* ent);
 
 // Actualiza cooldowns
 void Entity_Update(Entity* ent, float dt);
+
+// Aplica daño a la entidad
+void Entity_TakeDamage(Entity* ent, float amount);
 
 #endif

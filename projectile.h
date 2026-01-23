@@ -11,7 +11,8 @@ typedef struct {
     float speed;
     float lifeTime;    
     float radius;
-    float damage;       // Daño que hace al impactar
+    float damage;       
+    Team team;          // Equipo del proyectil (no daña aliados)
     bool active;
     Color color;
 } Projectile;
@@ -24,7 +25,7 @@ typedef struct {
 } ProjectileManager;
 
 void Proj_Init(ProjectileManager* pm);
-void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, float damage, Color color);
+void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, float damage, Team team, Color color);
 // Ahora Update recibe la lista de posibles víctimas
 void Proj_Update(ProjectileManager* pm, float dt, Entity* targets[], int targetCount);
 void Proj_Draw(ProjectileManager* pm);

@@ -1,13 +1,26 @@
 #include "entity.h"
+#include "raymath.h"
 
 void Entity_Init(Entity* ent) {
     ent->position = (Vector3){0,0,0};
     ent->radius = 0.5f;
     ent->speed = 10.0f;
     ent->active = true;
+    ent->team = TEAM_NEUTRAL; // Por defecto
     ent->health = 100;
     ent->maxHealth = 100;
     ent->mana = 100;
+
+    ent->attackRange = 5.0f;
+    ent->attackDamage = 10.0f;
+    ent->attackCooldown = 1.0f;
+    ent->attackTimer = 0.0f;
+    ent->targetEntity = 0; // NULL
+    ent->onAttack = 0;
+
+    ent->isDashing = false;
+    ent->dashTimer = 0.0f;
+    ent->dashVelocity = (Vector3){0,0,0};
 
     ent->onQ = 0; 
     ent->onW = 0;
@@ -22,6 +35,21 @@ void Entity_Init(Entity* ent) {
 
 void Entity_Update(Entity* ent, float dt) {
     if (!ent->active) return;
+
+    // Timer de ataque
+    if (ent->attackTimer > 0) ent->attackTimer -= dt;
+
+    // Lógica de Dash (Movimiento forzado que ignora todo lo demás)
+    if (ent->isDashing) {
+        ent->position = Vector3Add(ent->position, Vector3Scale(ent->dashVelocity, dt));
+        ent->dashTimer -= dt;
+        if (ent->dashTimer <= 0) {
+            ent->isDashing = false;
+            ent->dashTimer = 0;
+        }
+        return; // Si estamos dasheando, no hacemos nada más (cooldowns siguen bajando?)
+        // Decisión de diseño: Cooldowns bajan durante dash? Digamos que sí.
+    }
 
     // Reducir Cooldowns
     if (ent->cdQ > 0) ent->cdQ -= dt;

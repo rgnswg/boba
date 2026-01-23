@@ -7,7 +7,7 @@ void Proj_Init(ProjectileManager* pm) {
     }
 }
 
-void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, float damage, Color color) {
+void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, float life, float radius, float damage, Team team, Color color) {
     for (int i = 0; i < MAX_PROJECTILES; i++) {
         if (!pm->pool[i].active) {
             pm->pool[i].active = true;
@@ -17,6 +17,7 @@ void Proj_Spawn(ProjectileManager* pm, Vector3 pos, Vector3 dir, float speed, fl
             pm->pool[i].lifeTime = life;
             pm->pool[i].radius = radius;
             pm->pool[i].damage = damage;
+            pm->pool[i].team = team;
             pm->pool[i].color = color;
             return;
         }
@@ -40,23 +41,27 @@ void Proj_Update(ProjectileManager* pm, float dt, Entity* targets[], int targetC
         Vector3 velocity = Vector3Scale(p->direction, p->speed * dt);
         Vector3 nextPos = Vector3Add(p->position, velocity);
         
-        // 3. Colisión con Entidades (Hit Detection simple)
+        // 3. Colisión
         bool hit = false;
         for (int t = 0; t < targetCount; t++) {
             Entity* ent = targets[t];
             if (!ent->active) continue;
+            
+            // FUEGO AMIGO OFF:
+            // Si son del mismo equipo, ignorar colisión.
+            // Excepción: TEAM_NEUTRAL recibe daño de todos (y sus proyectiles dañan a todos)
+            if (p->team != TEAM_NEUTRAL && ent->team == p->team) continue;
 
-            // Chequeo Esfera-Esfera (Radio Proyectil + Radio Entidad)
             if (CheckCollisionSpheres(nextPos, p->radius, ent->position, ent->radius)) {
                 // IMPACTO!
                 Entity_TakeDamage(ent, p->damage);
                 hit = true;
-                break; // Un proyectil golpea a uno solo y desaparece (por ahora)
+                break; 
             }
         }
 
         if (hit) {
-            p->active = false; // Destruir proyectil
+            p->active = false; 
         } else {
             p->position = nextPos;
         }

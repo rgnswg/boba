@@ -28,6 +28,7 @@ void Dummy_Init(Entity* ent) {
     ent->maxHealth = 1000;
     ent->health = 1000;
     ent->radius = 0.5f; // Radio de colisión
+    ent->team = TEAM_NEUTRAL; // Dummy es neutral (todos le pegan)
 
     ent->onDraw = Dummy_Draw;
     ent->onDeath = Dummy_OnDeath;

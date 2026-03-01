@@ -40,6 +40,10 @@ struct Entity {
   float attackTimer;           // Contador para el siguiente ataque
   struct Entity *targetEntity; // A quién estamos atacando (o persiguiendo)
 
+  // Estado de Muerte y Respawn
+  bool isDead;
+  float respawnTimer; // segundos restantes para respawnear
+
   // Estado de Movimiento Especial (Dash/Leap)
   bool isDashing;
   float dashTimer;

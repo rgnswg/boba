@@ -1,7 +1,7 @@
 /*
  * server.c — Servidor Headless de Boba MOBA (ENet/UDP)
  *
- * Servidor autoritativo con ENet:
+ * Servidor autoritativo con ENet — Hasta 10 jugadores simultáneos.
  * - Canal 0 (unreliable): recibe inputs, envía snapshots
  * - Canal 1 (reliable): envía ConnectAck, game events
  */
@@ -16,14 +16,16 @@
 #include "raylib.h"
 #include "raymath.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#define SERVER_TICK_HZ 30 // 30Hz tick rate (estándar MOBA)
+#define SERVER_TICK_HZ 60 // 60Hz tick rate (bajo latency para MOBA)
 #define SERVER_TICK_NS (1000000000 / SERVER_TICK_HZ)
+#define RESPAWN_TIME 5.0f // segundos de muerte antes de respawnear
 
 // ----- Estado del juego -----
 
@@ -44,6 +46,38 @@ static int register_entity(Entity *ent) {
   return idx;
 }
 
+// ----- Slots de Jugadores -----
+
+#define MAX_PLAYERS 10
+
+typedef struct {
+  ENetPeer *peer; // NULL = slot libre
+  int netId;      // índice en g_entities[]
+} PlayerSlot;
+
+static PlayerSlot g_players[MAX_PLAYERS];
+static int g_playerCount = 0;
+
+// Buscar slot por peer
+static int find_slot_by_peer(ENetPeer *peer) {
+  for (int i = 0; i < MAX_PLAYERS; i++) {
+    if (g_players[i].peer == peer)
+      return i;
+  }
+  return -1;
+}
+
+// Buscar un slot libre
+static int find_free_slot(void) {
+  for (int i = 0; i < MAX_PLAYERS; i++) {
+    if (g_players[i].peer == NULL)
+      return i;
+  }
+  return -1;
+}
+
+// ----- Snapshot -----
+
 static void build_snapshot(StateSnapshot *snap) {
   snap->entityCount = g_entityCount;
   for (int i = 0; i < g_entityCount; i++) {
@@ -58,6 +92,8 @@ static void build_snapshot(StateSnapshot *snap) {
     ne->radius = e->radius;
     ne->team = (int32_t)e->team;
     ne->active = e->active ? 1 : 0;
+    ne->isDead = e->isDead ? 1 : 0;
+    ne->respawnTimer = e->respawnTimer;
   }
   int projCount = 0;
   for (int i = 0; i < MAX_PROJECTILES; i++) {
@@ -90,6 +126,10 @@ static void apply_input(int playerNetId, const InputPacket *inp) {
     return;
   MovingEntity *me = &g_entities[playerNetId];
   Entity *player = &me->entity;
+
+  // No aceptar inputs de jugadores muertos
+  if (player->isDead)
+    return;
 
   if (inp->rightClick) {
     if (inp->attackTarget >= 0 && inp->attackTarget < g_entityCount) {
@@ -128,7 +168,7 @@ static void update_movement(int playerNetId, float dt) {
     return;
   MovingEntity *me = &g_entities[playerNetId];
   Entity *player = &me->entity;
-  if (player->isDashing)
+  if (player->isDashing || player->isDead)
     return;
 
   if (player->targetEntity) {
@@ -176,7 +216,8 @@ static void sleep_ns(long long ns) {
 // ----- Main -----
 
 int main(void) {
-  printf("[SERVER] Iniciando Boba Server (ENet/UDP)...\n");
+  printf("[SERVER] Iniciando Boba Server (ENet/UDP) — Hasta %d jugadores\n",
+         MAX_PLAYERS);
 
   if (enet_initialize() != 0) {
     fprintf(stderr, "[SERVER] Error inicializando ENet.\n");
@@ -187,12 +228,13 @@ int main(void) {
   Map_InitHeadless(&g_map);
   Proj_Init(&g_projMgr);
 
-  Entity playerEnt;
-  Mongo_Init(&playerEnt, &g_projMgr);
-  playerEnt.position = (Vector3){0.0f, 1.0f, 0.0f};
-  playerEnt.team = TEAM_BLUE;
-  int playerNetId = register_entity(&playerEnt);
+  // Inicializar slots de jugadores
+  for (int i = 0; i < MAX_PLAYERS; i++) {
+    g_players[i].peer = NULL;
+    g_players[i].netId = -1;
+  }
 
+  // Entidades NPC de práctica (dummies)
   Entity dummyEnt;
   Dummy_Init(&dummyEnt);
   dummyEnt.position = (Vector3){10.0f, 1.0f, 5.0f};
@@ -204,45 +246,23 @@ int main(void) {
   allyDummyEnt.team = TEAM_BLUE;
   register_entity(&allyDummyEnt);
 
-  Entity *projTargets[MAX_SERVER_ENTITIES];
-  int projTargetCount = 0;
-  for (int i = 0; i < g_entityCount; i++) {
-    if (i != playerNetId)
-      projTargets[projTargetCount++] = &g_entities[i].entity;
-  }
-
-  // Crear host ENet (servidor)
+  // Crear host ENet (servidor — acepta hasta MAX_PLAYERS conexiones)
   ENetAddress address;
   address.host = ENET_HOST_ANY;
   address.port = SERVER_PORT;
 
-  ENetHost *server = enet_host_create(&address, 1, NUM_CHANNELS, 0, 0);
+  ENetHost *server =
+      enet_host_create(&address, MAX_PLAYERS, NUM_CHANNELS, 0, 0);
   if (!server) {
     fprintf(stderr, "[SERVER] Error creando host ENet.\n");
     return 1;
   }
 
-  printf("[SERVER] Escuchando en puerto %d (UDP/ENet) — Esperando cliente...\n",
-         SERVER_PORT);
+  printf(
+      "[SERVER] Escuchando en puerto %d (UDP/ENet) — Esperando jugadores...\n",
+      SERVER_PORT);
 
-  // Esperar conexión del cliente
-  ENetPeer *clientPeer = NULL;
-  while (!clientPeer) {
-    ENetEvent event;
-    if (enet_host_service(server, &event, 100) > 0) {
-      if (event.type == ENET_EVENT_TYPE_CONNECT) {
-        clientPeer = event.peer;
-        printf("[SERVER] Cliente conectado!\n");
-
-        // Enviar ACK (reliable)
-        ConnectAck ack = {.playerNetId = playerNetId};
-        send_reliable(clientPeer, PKT_CONNECT_ACK, &ack, sizeof(ack));
-        enet_host_flush(server);
-      }
-    }
-  }
-
-  // Game Loop
+  // Game Loop — no bloqueamos esperando conexiones, las manejamos dentro
   bool running = true;
   long long prevTime = get_ns();
 
@@ -253,60 +273,187 @@ int main(void) {
       dt = 0.1f;
     prevTime = frameStart;
 
-    // 1. Procesar eventos ENet (drenar todos los inputs pendientes)
+    // 1. Procesar eventos ENet
     {
-      InputPacket lastAction = {0};
-      lastAction.attackTarget = -1;
-      lastAction.aimTargetId = -1;
-      bool gotAction = false;
+      // Buffer temporal para acumular el último input de cada jugador este tick
+      InputPacket lastInputs[MAX_PLAYERS];
+      bool gotInput[MAX_PLAYERS];
+      for (int i = 0; i < MAX_PLAYERS; i++) {
+        memset(&lastInputs[i], 0, sizeof(InputPacket));
+        lastInputs[i].attackTarget = -1;
+        lastInputs[i].aimTargetId = -1;
+        gotInput[i] = false;
+      }
 
       ENetEvent event;
       while (enet_host_service(server, &event, 0) > 0) {
         switch (event.type) {
+
+        case ENET_EVENT_TYPE_CONNECT: {
+          // Nuevo jugador conectado
+          int slotIdx = find_free_slot();
+          if (slotIdx < 0) {
+            printf("[SERVER] Servidor lleno — rechazando conexión.\n");
+            enet_peer_disconnect(event.peer, 0);
+            break;
+          }
+
+          // Crear entidad Mongo para el nuevo jugador
+          Entity playerEnt;
+          Mongo_Init(&playerEnt, &g_projMgr);
+
+          // Spawn en círculo para no superponer
+          float angle = (float)slotIdx * (2.0f * PI / (float)MAX_PLAYERS);
+          float spawnRadius = 5.0f;
+          playerEnt.position = (Vector3){cosf(angle) * spawnRadius, 1.0f,
+                                         sinf(angle) * spawnRadius};
+
+          // Alternar equipos: slots pares → BLUE, impares → RED
+          playerEnt.team = (slotIdx % 2 == 0) ? TEAM_BLUE : TEAM_RED;
+
+          int netId = register_entity(&playerEnt);
+          if (netId < 0) {
+            printf("[SERVER] Sin espacio para más entidades.\n");
+            enet_peer_disconnect(event.peer, 0);
+            break;
+          }
+
+          g_players[slotIdx].peer = event.peer;
+          g_players[slotIdx].netId = netId;
+          g_playerCount++;
+
+          // Guardar slotIdx en el peer data para lookup rápido
+          event.peer->data = (void *)(intptr_t)slotIdx;
+
+          // Enviar ACK (reliable)
+          ConnectAck ack = {.playerNetId = netId};
+          send_reliable(event.peer, PKT_CONNECT_ACK, &ack, sizeof(ack));
+          enet_host_flush(server);
+
+          printf("[SERVER] Jugador conectado → slot=%d netId=%d equipo=%s "
+                 "(%d/%d jugadores)\n",
+                 slotIdx, netId, playerEnt.team == TEAM_BLUE ? "BLUE" : "RED",
+                 g_playerCount, MAX_PLAYERS);
+          break;
+        }
+
         case ENET_EVENT_TYPE_RECEIVE: {
+          int slotIdx = (int)(intptr_t)event.peer->data;
+          if (slotIdx < 0 || slotIdx >= MAX_PLAYERS ||
+              g_players[slotIdx].peer != event.peer) {
+            enet_packet_destroy(event.packet);
+            break;
+          }
+
           PacketHeader hdr;
           InputPacket inp;
           int pktType =
               parse_packet(event.packet, &hdr, &inp, sizeof(InputPacket));
           if (pktType == PKT_INPUT && hdr.length == (int)sizeof(InputPacket)) {
             if (inp.rightClick || inp.keyQ || inp.keyW) {
-              lastAction = inp;
-              gotAction = true;
+              lastInputs[slotIdx] = inp;
+              gotInput[slotIdx] = true;
             }
           }
           enet_packet_destroy(event.packet);
           break;
         }
-        case ENET_EVENT_TYPE_DISCONNECT:
-          printf("[SERVER] Cliente desconectado.\n");
-          running = false;
+
+        case ENET_EVENT_TYPE_DISCONNECT: {
+          int slotIdx = (int)(intptr_t)event.peer->data;
+          if (slotIdx >= 0 && slotIdx < MAX_PLAYERS &&
+              g_players[slotIdx].peer == event.peer) {
+            int netId = g_players[slotIdx].netId;
+            if (netId >= 0 && netId < g_entityCount) {
+              g_entities[netId].entity.active = false;
+            }
+            printf("[SERVER] Jugador desconectado — slot=%d netId=%d "
+                   "(%d/%d jugadores)\n",
+                   slotIdx, netId, g_playerCount - 1, MAX_PLAYERS);
+            g_players[slotIdx].peer = NULL;
+            g_players[slotIdx].netId = -1;
+            g_playerCount--;
+          }
           break;
+        }
+
         default:
           break;
         }
       }
 
-      if (gotAction) {
-        apply_input(playerNetId, &lastAction);
+      // Aplicar inputs acumulados de cada jugador
+      for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (gotInput[i]) {
+          apply_input(g_players[i].netId, &lastInputs[i]);
+        }
       }
     }
 
-    // 2. Actualizar movimiento
-    update_movement(playerNetId, dt);
+    // 2. Actualizar movimiento de todos los jugadores conectados
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+      if (g_players[i].peer != NULL && g_players[i].netId >= 0) {
+        update_movement(g_players[i].netId, dt);
+      }
+    }
 
-    // 3. Actualizar entidades
+    // 2b. Respawn timer — contar y respawnear jugadores muertos
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+      if (g_players[i].peer == NULL || g_players[i].netId < 0)
+        continue;
+      Entity *ent = &g_entities[g_players[i].netId].entity;
+      MovingEntity *me = &g_entities[g_players[i].netId];
+      if (!ent->isDead)
+        continue;
+
+      ent->respawnTimer -= dt;
+      if (ent->respawnTimer <= 0.0f) {
+        // Respawnear
+        ent->isDead = false;
+        ent->respawnTimer = 0.0f;
+        ent->health = ent->maxHealth;
+        ent->targetEntity = NULL;
+        me->pathLength = 0;
+        me->pathIndex = 0;
+
+        // Posición de spawn por equipo
+        if (ent->team == TEAM_BLUE) {
+          ent->position = (Vector3){-8.0f, 1.0f, -8.0f};
+        } else {
+          ent->position = (Vector3){8.0f, 1.0f, 8.0f};
+        }
+        printf("[SERVER] Jugador netId=%d respawneado\n", g_players[i].netId);
+      }
+    }
+
+    // 3. Actualizar entidades (cooldowns, dashes, etc.)
     for (int i = 0; i < g_entityCount; i++) {
       Entity_Update(&g_entities[i].entity, dt);
     }
 
-    // 4. Actualizar proyectiles
-    Proj_Update(&g_projMgr, dt, projTargets, projTargetCount);
+    // 4. Actualizar proyectiles — construir lista de targets (todas las
+    // entidades activas)
+    {
+      Entity *projTargets[MAX_SERVER_ENTITIES];
+      int projTargetCount = 0;
+      for (int i = 0; i < g_entityCount; i++) {
+        if (g_entities[i].entity.active) {
+          projTargets[projTargetCount++] = &g_entities[i].entity;
+        }
+      }
+      Proj_Update(&g_projMgr, dt, projTargets, projTargetCount);
+    }
 
-    // 5. Enviar snapshot (unreliable — si se pierde, el siguiente reemplaza)
-    if (clientPeer) {
+    // 5. Enviar snapshot a todos los peers conectados (unreliable)
+    if (g_playerCount > 0) {
       StateSnapshot snap;
       build_snapshot(&snap);
-      send_unreliable(clientPeer, PKT_STATE_SNAPSHOT, &snap, sizeof(snap));
+      for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (g_players[i].peer != NULL) {
+          send_unreliable(g_players[i].peer, PKT_STATE_SNAPSHOT, &snap,
+                          sizeof(snap));
+        }
+      }
     }
 
     // 6. Sleep

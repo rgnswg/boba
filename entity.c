@@ -19,6 +19,9 @@ void Entity_Init(Entity *ent) {
   ent->targetEntity = 0; // NULL
   ent->onAttack = 0;
 
+  ent->isDead = false;
+  ent->respawnTimer = 0.0f;
+
   ent->isDashing = false;
   ent->dashTimer = 0.0f;
   ent->dashVelocity = (Vector3){0, 0, 0};
@@ -74,7 +77,7 @@ void Entity_Update(Entity *ent, float dt) {
 }
 
 void Entity_TakeDamage(Entity *ent, float amount) {
-  if (!ent->active)
+  if (!ent->active || ent->isDead)
     return;
 
   ent->health -= amount;
@@ -87,8 +90,9 @@ void Entity_TakeDamage(Entity *ent, float amount) {
     if (ent->onDeath) {
       ent->onDeath(ent);
     } else {
-      // Comportamiento default: Desaparecer
-      ent->active = false;
+      // Comportamiento default: marcar como muerto (el servidor maneja respawn)
+      ent->isDead = true;
+      ent->respawnTimer = 5.0f; // hardcoded por ahora
     }
   }
 }

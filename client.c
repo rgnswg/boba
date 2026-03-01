@@ -2,8 +2,11 @@
  * client.c — Cliente Gráfico de Boba MOBA (ENet/UDP)
  *
  * Predicción local del movimiento + servidor autoritativo.
- * Inputs se envían throttled a 30Hz via ENet (unreliable).
+ * Inputs se envían throttled a 60Hz via ENet (unreliable).
  * Snapshots se reciben unreliable — si se pierde uno, el siguiente reemplaza.
+ *
+ * INTERPOLACIÓN: Los jugadores remotos se renderizan interpolando entre
+ * los 2 últimos snapshots recibidos, dando movimiento suave a cualquier FPS.
  */
 
 #include "map.h"
@@ -13,6 +16,7 @@
 #include "raylib.h"
 #include "raymath.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,15 +24,79 @@
 
 // ---- Estado ----
 
-static StateSnapshot g_snapshot;
-static bool g_hasSnapshot = false;
 static int g_playerNetId = -1;
-static float g_timeSinceSnap = 0.0f; // para extrapolar proyectiles
 
 // Predicción local
 static MovingEntity g_localPlayer;
 static GameMap g_localMap;
 static bool g_localReady = false;
+static bool g_initialSynced = false; // ¿ya sincronizamos posición inicial?
+
+// Estado de muerte (leído del snapshot)
+static bool g_localDead = false;
+static float g_localRespawnTimer = 0.0f;
+
+// Debug HUD
+static bool g_debugHud = false;
+
+// ---- Snapshot Buffer para Interpolación ----
+
+// Almacenamos los 2 últimos snapshots con sus timestamps de recepción.
+// Los jugadores remotos se renderizan interpolando entre prev y curr.
+static StateSnapshot g_snapPrev;
+static StateSnapshot g_snapCurr;
+static double g_snapPrevTime = 0.0; // GetTime() al recibir snapPrev
+static double g_snapCurrTime = 0.0; // GetTime() al recibir snapCurr
+static int g_snapCount = 0; // cuántos snapshots hemos recibido (0, 1, 2+)
+static double g_interpDelay =
+    1.0 / 60.0; // delay de interpolación (auto-ajustado)
+
+// ---- Interpolación ----
+
+// Busca una entidad por netId en un snapshot. Retorna NULL si no la encuentra.
+static const NetEntity *find_net_entity(const StateSnapshot *snap, int netId) {
+  for (int i = 0; i < snap->entityCount; i++) {
+    if (snap->entities[i].netId == netId)
+      return &snap->entities[i];
+  }
+  return NULL;
+}
+
+// Calcula la posición interpolada de una entidad remota.
+// renderTime = GetTime() actual.
+// Si solo tenemos 1 snapshot, devolvemos posición directa (sin interp).
+// renderTime debe ser now - g_interpDelay para que t quede en [0, 1]
+static Vector3 interp_entity_pos(int netId, double renderTime) {
+  const NetEntity *curr = find_net_entity(&g_snapCurr, netId);
+  if (!curr)
+    return (Vector3){0, 0, 0};
+
+  Vector3 currPos = {curr->x, curr->y, curr->z};
+
+  if (g_snapCount < 2)
+    return currPos; // Solo 1 snapshot, no podemos interpolar
+
+  const NetEntity *prev = find_net_entity(&g_snapPrev, netId);
+  if (!prev)
+    return currPos; // Entidad nueva, no existe en snap anterior
+
+  Vector3 prevPos = {prev->x, prev->y, prev->z};
+
+  // Calcular t: fracción del intervalo entre snapshots
+  double interval = g_snapCurrTime - g_snapPrevTime;
+  if (interval <= 0.0001)
+    return currPos; // Evitar división por 0
+
+  float t = (float)((renderTime - g_snapPrevTime) / interval);
+
+  // Clampear a [0, 1] — interpolación pura, sin extrapolación
+  if (t < 0.0f)
+    t = 0.0f;
+  if (t > 1.0f)
+    t = 1.0f;
+
+  return Vector3Lerp(prevPos, currPos, t);
+}
 
 // ---- Colores ----
 
@@ -48,7 +116,7 @@ static Color team_color(int team, bool isPlayer) {
 // ---- Render ----
 
 static void draw_entities(const StateSnapshot *snap, int playerNetId,
-                          Camera3D camera) {
+                          Camera3D camera, double renderTime) {
   for (int i = 0; i < snap->entityCount; i++) {
     const NetEntity *e = &snap->entities[i];
     if (!e->active)
@@ -57,9 +125,11 @@ static void draw_entities(const StateSnapshot *snap, int playerNetId,
     bool isPlayer = (e->netId == playerNetId);
     Vector3 pos;
     if (isPlayer && g_localReady) {
+      // Jugador local: predicción instantánea
       pos = g_localPlayer.entity.position;
     } else {
-      pos = (Vector3){e->x, e->y, e->z};
+      // Jugador remoto / NPC: interpolación suave
+      pos = interp_entity_pos(e->netId, renderTime);
     }
 
     Color bodyColor = team_color(e->team, isPlayer);
@@ -83,14 +153,17 @@ static void draw_entities(const StateSnapshot *snap, int playerNetId,
       DrawText("YOU", barX, barY - 16, 12, WHITE);
   }
 
+  // Proyectiles: extrapolación por velocidad (ya funcionan bien)
+  float timeSinceSnap = (float)(renderTime - g_snapCurrTime);
+  if (timeSinceSnap < 0.0f)
+    timeSinceSnap = 0.0f;
+
   for (int i = 0; i < snap->projectileCount; i++) {
     const NetProjectile *p = &snap->projectiles[i];
     if (!p->active)
       continue;
-    // Extrapolar posición con velocidad entre snapshots (30Hz → suave)
-    Vector3 pos = {p->x + p->vx * g_timeSinceSnap,
-                   p->y + p->vy * g_timeSinceSnap,
-                   p->z + p->vz * g_timeSinceSnap};
+    Vector3 pos = {p->x + p->vx * timeSinceSnap, p->y + p->vy * timeSinceSnap,
+                   p->z + p->vz * timeSinceSnap};
     DrawSphere(pos, p->radius,
                (Color){(unsigned char)p->colorR, (unsigned char)p->colorG,
                        (unsigned char)p->colorB, 255});
@@ -190,14 +263,15 @@ int main(void) {
     return 1;
   }
 
-  // Inicializar predicción local
+  // Inicializar predicción local (posición se sincroniza desde el primer
+  // snapshot)
   Map_InitHeadless(&g_localMap);
   Entity_Init(&g_localPlayer.entity);
-  g_localPlayer.entity.position = (Vector3){0.0f, 1.0f, 0.0f};
   g_localPlayer.entity.speed = 10.0f;
   g_localPlayer.entity.radius = 0.8f;
   MovingEntity_Init(&g_localPlayer);
   g_localReady = true;
+  g_initialSynced = false;
 
   // Ventana
   const int screenW = 1280, screenH = 720;
@@ -217,8 +291,8 @@ int main(void) {
                              50};
   bool shouldClose = false;
 
-// Throttle envío a 30Hz
-#define SEND_INTERVAL (1.0f / 30.0f)
+// Throttle envío a 60Hz (match server tick rate)
+#define SEND_INTERVAL (1.0f / 60.0f)
   float sendTimer = 0.0f;
   InputPacket pendingInp = {0};
   pendingInp.attackTarget = -1;
@@ -227,35 +301,27 @@ int main(void) {
 
   while (!shouldClose && !WindowShouldClose()) {
     float dt = GetFrameTime();
+    double now = GetTime();
     sendTimer += dt;
 
     // ===== 1. INPUT =====
     if (IsKeyPressed(KEY_ESCAPE))
       menuActive = !menuActive;
 
-    if (!menuActive) {
+    if (!menuActive && !g_localDead) {
       Ray mouseRay = GetMouseRay(GetMousePosition(), camera);
-      int hoveredId = g_hasSnapshot
-                          ? pick_entity(&g_snapshot, mouseRay, g_playerNetId)
+      int hoveredId = g_snapCount > 0
+                          ? pick_entity(&g_snapCurr, mouseRay, g_playerNetId)
                           : -1;
 
       // Cursor
-      if (hoveredId >= 0 && g_hasSnapshot) {
-        const NetEntity *he = NULL;
-        for (int i = 0; i < g_snapshot.entityCount; i++) {
-          if (g_snapshot.entities[i].netId == hoveredId) {
-            he = &g_snapshot.entities[i];
-            break;
-          }
-        }
+      if (hoveredId >= 0 && g_snapCount > 0) {
+        const NetEntity *he = find_net_entity(&g_snapCurr, hoveredId);
         if (he) {
           int playerTeam = 1;
-          for (int i = 0; i < g_snapshot.entityCount; i++) {
-            if (g_snapshot.entities[i].netId == g_playerNetId) {
-              playerTeam = g_snapshot.entities[i].team;
-              break;
-            }
-          }
+          const NetEntity *me = find_net_entity(&g_snapCurr, g_playerNetId);
+          if (me)
+            playerTeam = me->team;
           SetMouseCursor(he->team == playerTeam ? MOUSE_CURSOR_POINTING_HAND
                                                 : MOUSE_CURSOR_CROSSHAIR);
         }
@@ -303,7 +369,7 @@ int main(void) {
       }
     }
 
-    // ===== 1b. ENVIAR INPUT (throttled 30Hz, unreliable) =====
+    // ===== 1b. ENVIAR INPUT (throttled 60Hz, unreliable) =====
     if (sendTimer >= SEND_INTERVAL) {
       sendTimer -= SEND_INTERVAL;
       if (hasPendingAction) {
@@ -333,9 +399,21 @@ int main(void) {
               parse_packet(event.packet, &hdr, &snap, sizeof(StateSnapshot));
           if (pktType == PKT_STATE_SNAPSHOT &&
               hdr.length == (int)sizeof(StateSnapshot)) {
-            g_snapshot = snap;
-            g_hasSnapshot = true;
-            g_timeSinceSnap = 0.0f; // reset para extrapolación de proyectiles
+            // Shift buffer: curr → prev, nuevo → curr
+            g_snapPrev = g_snapCurr;
+            g_snapPrevTime = g_snapCurrTime;
+            g_snapCurr = snap;
+            g_snapCurrTime = GetTime();
+            g_snapCount++;
+
+            // Auto-ajustar delay de interpolación al intervalo real
+            if (g_snapCount >= 2) {
+              double measured = g_snapCurrTime - g_snapPrevTime;
+              if (measured > 0.001 && measured < 0.5) {
+                // Suavizar para evitar saltos por jitter
+                g_interpDelay = g_interpDelay * 0.9 + measured * 0.1;
+              }
+            }
           }
           enet_packet_destroy(event.packet);
           break;
@@ -349,34 +427,49 @@ int main(void) {
         }
       }
 
-      // Reconciliación mínima: solo hard-reset para divergencias imposibles.
-      // NO sincronizar cuando el path termina: la predicción local ya llegó
-      // al destino correcto. El servidor converge naturalmente.
-      // El LERP causaba rubberbanding: tiraba al jugador ATRÁS porque
-      // el server está 1-2 ticks detrás.
-      if (g_hasSnapshot && g_localReady) {
-        for (int i = 0; i < g_snapshot.entityCount; i++) {
-          if (g_snapshot.entities[i].netId == g_playerNetId) {
-            Vector3 srvPos = {g_snapshot.entities[i].x,
-                              g_snapshot.entities[i].y,
-                              g_snapshot.entities[i].z};
+      // Sincronización de posición
+      if (g_snapCount > 0 && g_localReady) {
+        const NetEntity *me = find_net_entity(&g_snapCurr, g_playerNetId);
+        if (me) {
+          Vector3 srvPos = {me->x, me->y, me->z};
+
+          // Primera vez: sync total desde el servidor (spawn position)
+          if (!g_initialSynced) {
+            g_localPlayer.entity.position = srvPos;
+            g_localPlayer.pathLength = 0;
+            g_localPlayer.pathIndex = 0;
+            g_initialSynced = true;
+            printf("[CLIENT] Sync inicial: pos=(%.1f, %.1f, %.1f)\n", srvPos.x,
+                   srvPos.y, srvPos.z);
+          } else {
+            // Reconciliación: reset si divergencia > 3m
             Vector3 diff =
                 Vector3Subtract(srvPos, g_localPlayer.entity.position);
             diff.y = 0;
-            // Solo resetear para teleports/spawns (>10m de divergencia)
-            if (Vector3Length(diff) > 10.0f) {
+            if (Vector3Length(diff) > 3.0f) {
               g_localPlayer.entity.position = srvPos;
               g_localPlayer.pathLength = 0;
               g_localPlayer.pathIndex = 0;
             }
-            break;
+          }
+
+          // Sync muerte/respawn desde el servidor
+          if (me->isDead) {
+            g_localDead = true;
+            g_localRespawnTimer = me->respawnTimer;
+          } else if (g_localDead) {
+            // Estaba muerto y el servidor dice que ya no: respawneó
+            g_localPlayer.entity.position = srvPos;
+            g_localPlayer.pathLength = 0;
+            g_localPlayer.pathIndex = 0;
+            g_localDead = false;
+            g_localRespawnTimer = 0.0f;
           }
         }
       }
     }
 
-    // ===== 3. SIMULAR PREDICCIÓN LOCAL + avanzar extrapolación =====
-    g_timeSinceSnap += dt;
+    // ===== 3. SIMULAR PREDICCIÓN LOCAL =====
     if (g_localReady)
       MovingEntity_Update(&g_localPlayer, dt);
 
@@ -391,16 +484,90 @@ int main(void) {
     ClearBackground((Color){30, 30, 40, 255});
     BeginMode3D(camera);
     DrawGrid(40, 1.0f);
-    if (g_hasSnapshot)
-      draw_entities(&g_snapshot, g_playerNetId, camera);
+    if (g_snapCount > 0) {
+      // Renderizar un tick en el pasado → interpolación pura, sin extrapolación
+      double renderTime = now - g_interpDelay;
+      draw_entities(&g_snapCurr, g_playerNetId, camera, renderTime);
+    }
     EndMode3D();
+
+    // ===== DEATH OVERLAY =====
+    if (g_localDead) {
+      // Overlay oscuro semi-transparente (simula escala de grises)
+      DrawRectangle(0, 0, screenW, screenH, (Color){0, 0, 0, 150});
+
+      // timer de respawn
+      int timerVal = (int)ceilf(g_localRespawnTimer);
+      if (timerVal < 0)
+        timerVal = 0;
+      const char *timerText = TextFormat("%d", timerVal);
+      int timerFontSize = 120;
+      int timerW = MeasureText(timerText, timerFontSize);
+      DrawText(timerText, screenW / 2 - timerW / 2, screenH / 2 - 80,
+               timerFontSize, WHITE);
+
+      const char *deathMsg = "HAS MUERTO";
+      int msgFontSize = 36;
+      int msgW = MeasureText(deathMsg, msgFontSize);
+      DrawText(deathMsg, screenW / 2 - msgW / 2, screenH / 2 + 50, msgFontSize,
+               RED);
+    }
 
     DrawText(TextFormat("FPS: %d", GetFPS()), screenW - 100, 10, 20, WHITE);
     DrawText(TextFormat("NetId: %d", g_playerNetId), 10, 10, 16, GRAY);
     DrawText("Q", 20, screenH - 60, 30, WHITE);
     DrawText("W", 100, screenH - 60, 30, WHITE);
 
-    if (!g_hasSnapshot) {
+    // ===== DEBUG HUD (F3) =====
+    if (IsKeyPressed(KEY_F3))
+      g_debugHud = !g_debugHud;
+
+    if (g_debugHud && g_snapCount > 0) {
+      int dy = 30;
+      int y = 30;
+      DrawRectangle(0, y - 2, 400, 18 + dy * (g_snapCurr.entityCount + 3),
+                    (Color){0, 0, 0, 180});
+
+      DrawText("[DEBUG - F3]", 10, y, 14, LIME);
+      y += dy;
+
+      // Local prediction vs server
+      const NetEntity *me = find_net_entity(&g_snapCurr, g_playerNetId);
+      if (me && g_localReady) {
+        Vector3 lp = g_localPlayer.entity.position;
+        DrawText(TextFormat("LOCAL  x:%.2f z:%.2f", lp.x, lp.z), 10, y, 14,
+                 SKYBLUE);
+        y += dy;
+        DrawText(TextFormat("SERVER x:%.2f z:%.2f", me->x, me->z), 10, y, 14,
+                 ORANGE);
+        y += dy;
+        float dx = lp.x - me->x;
+        float dz = lp.z - me->z;
+        float delta = sqrtf(dx * dx + dz * dz);
+        Color deltaColor = delta < 0.5f ? GREEN : (delta < 2.0f ? YELLOW : RED);
+        DrawText(TextFormat("DELTA  %.3f m", delta), 10, y, 14, deltaColor);
+        y += dy;
+      }
+
+      DrawText(TextFormat("InterpDelay: %.1f ms", g_interpDelay * 1000.0), 10,
+               y, 14, GRAY);
+      y += dy;
+
+      // Todas las entidades
+      for (int i = 0; i < g_snapCurr.entityCount; i++) {
+        const NetEntity *e = &g_snapCurr.entities[i];
+        if (!e->active)
+          continue;
+        const char *tag = (e->netId == g_playerNetId) ? "YOU" : "   ";
+        const char *team = (e->team == 1) ? "B" : (e->team == 2) ? "R" : "N";
+        DrawText(TextFormat("%s id:%d [%s] x:%.1f z:%.1f hp:%.0f", tag,
+                            e->netId, team, e->x, e->z, e->health),
+                 10, y, 12, (e->netId == g_playerNetId) ? SKYBLUE : WHITE);
+        y += dy - 8;
+      }
+    }
+
+    if (g_snapCount == 0) {
       DrawText("Esperando servidor...", screenW / 2 - 120, screenH / 2, 20,
                YELLOW);
     }

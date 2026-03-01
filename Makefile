@@ -1,6 +1,6 @@
-CC     = gcc
-CFLAGS = -Wall -std=c99 -Wno-missing-braces -I/opt/homebrew/include
-LDFLAGS = -L/opt/homebrew/lib -lraylib -lenet -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
+CC      = gcc
+CFLAGS  = -Wall -std=gnu99 -Wno-missing-braces
+LDFLAGS = -lraylib -lenet -lGL -lm -lpthread -ldl -lrt -lX11
 
 # Fuentes de lógica pura (usados por server y client)
 LOGIC_SRCS = map.c pathfinding.c entity.c projectile.c \

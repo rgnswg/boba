@@ -37,8 +37,10 @@ typedef struct {
   float x, y, z;
   float health, maxHealth;
   float radius;
-  int32_t team;   // 0=NEUTRAL, 1=BLUE, 2=RED
-  int32_t active; // bool como int
+  int32_t team;       // 0=NEUTRAL, 1=BLUE, 2=RED
+  int32_t active;     // bool como int
+  int32_t isDead;     // bool como int
+  float respawnTimer; // segundos restantes para respawn
 } NetEntity;
 
 // --- Snapshot de proyectil ---
